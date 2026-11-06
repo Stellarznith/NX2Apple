@@ -286,12 +286,28 @@ func hop(_ body: @escaping @MainActor () -> Void) {
         psoStageID = stageID
         psoStep = step
         psoNativeProgress = false
-        pollPSOArchive()
-        psoPollTask = Task { @MainActor [weak store = self] in
+        let workDir = effectiveWorkDir
+        psoPollTask = Task { [weak store = self] in
             while !Task.isCancelled {
+                if !workDir.isEmpty {
+                    let progress = await Task.detached(priority: .utility) {
+                        BuildProgress.psoArchiveProgress(workDir: workDir)
+                    }.value
+                    guard !Task.isCancelled else { break }
+                    if let progress {
+                        await MainActor.run {
+                            guard let store, store.psoStageID == stageID, !store.psoNativeProgress else { return }
+                            store.applyPSOArchiveProgress(progress, stageID: stageID)
+                        }
+                    }
+                }
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
-                guard !Task.isCancelled, let store, store.psoStageID == stageID, !store.psoNativeProgress else { break }
-                store.pollPSOArchive()
+                guard !Task.isCancelled else { break }
+                let keepGoing = await MainActor.run { [weak store] in
+                    guard let store else { return false }
+                    return store.psoStageID == stageID && !store.psoNativeProgress
+                }
+                if !keepGoing { break }
             }
         }
     }
@@ -304,19 +320,24 @@ func hop(_ body: @escaping @MainActor () -> Void) {
         psoNativeProgress = false
     }
 
-    /// Inspect `<workDir>/pso/mac-work` (or the iOS work directory) for completed `pso_offline.py` batches while the
+    /// Inspect `<workDir>/pso/mac-work` (or the iOS work directory / logs) for completed `pso_offline.py` batches while the
     /// `Pipeline archive` stage runs without native JSON counts from the script.
     package func pollPSOArchive() {
         guard !psoNativeProgress, let id = psoStageID, !effectiveWorkDir.isEmpty,
-              let i = stages.firstIndex(where: { $0.id == id && $0.state == .running }),
               let p = BuildProgress.psoArchiveProgress(workDir: effectiveWorkDir) else { return }
+        applyPSOArchiveProgress(p, stageID: id)
+    }
+
+    private func applyPSOArchiveProgress(_ p: PSOArchiveProgress, stageID: Int) {
+        guard !psoNativeProgress, psoStageID == stageID,
+              let i = stages.firstIndex(where: { $0.id == stageID && $0.state == .running }) else { return }
         let pct = min(Double(p.done) / Double(p.total) * 100.0, 99.0)
         let detail = BuildProgress.progressDetail([
             "step": psoStep,
             "done": p.done,
             "total": p.total,
-            "unit": "batches",
-            "note": p.merging ? "merging" : "",
+            "unit": t("prog.unit.batches"),
+            "note": p.merging ? t("prog.note.merging") : "",
         ])
         if stages[i].percent != pct || stages[i].detail != detail {
             stages[i].percent = pct

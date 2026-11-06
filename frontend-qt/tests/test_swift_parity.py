@@ -451,13 +451,16 @@ class ParityWindowTests(unittest.TestCase):
             self.assertIn('this PC', m.t('shell.copyExternalNote'))
 
     def test_pso_archive_progress(self) -> None:
+        from unittest import mock
         from nspb_qt import model
+        from nspb_qt.i18n import Lang
         with tempfile.TemporaryDirectory() as tmp:
             mac_work = Path(tmp, 'pso', 'mac-work')
             mac_work.mkdir(parents=True)
             entry = '{"vertex_function_descriptor":"v"}'
             (mac_work / 'bases.mtl4-json').write_text('[' + ','.join([entry] * 2500) + ']\n', encoding='utf-8')
-            self.assertEqual(model.pso_archive_progress(tmp), (0, 3, False))
+            # Without any `batches.<arch>` directory or batch log lines, return None (no misleading 0% bar)
+            self.assertIsNone(model.pso_archive_progress(tmp))
 
             arch = 'applegpu_g13s'
             for idx in (1, 2, 3):
@@ -469,13 +472,49 @@ class ParityWindowTests(unittest.TestCase):
             (mac_work / f'batches.{arch}' / '00002' / 'bases.mtl4-json').write_text('{}', encoding='utf-8')
             self.assertEqual(model.pso_archive_progress(tmp), (1, 3, False))
 
-            for idx in (2, 3):
-                b = mac_work / f'batches.{arch}' / f'{idx:05d}'
-                (b / 'bases.mtl4-json').write_text('{}', encoding='utf-8')
-                (b / f'{arch}.mtl4a').write_bytes(b'arch')
-                (b / f'key.{arch}').write_text('k\n', encoding='utf-8')
-            (mac_work / f'metal-pack.{arch}.log').write_text('', encoding='utf-8')
-            self.assertEqual(model.pso_archive_progress(tmp), (3, 3, True))
+            # Drive Model through the Pipeline archive stage and verify automatic polling, localization, and native takeover
+            with mock.patch.object(model.Model, 'check_deps', lambda self: None):
+                m = model.Model()
+            m.lang = Lang('en')
+            m.effective_work_dir = tmp
+            m._on_line('[12:00:01] [6/7] Pipeline archive · applegpu_g13s (metal-tt)')
+            try:
+                self.assertIsNotNone(m._pso_poll_stop)
+                self.assertFalse(m._pso_poll_stop.is_set())
+                self.assertAlmostEqual(m.stages[-1].percent, 100.0 / 3.0, places=1)
+                self.assertIn('1 / 3 batches', m.stages[-1].detail)
+
+                for idx in (2, 3):
+                    b = mac_work / f'batches.{arch}' / f'{idx:05d}'
+                    (b / 'bases.mtl4-json').write_text('{}', encoding='utf-8')
+                    (b / f'{arch}.mtl4a').write_bytes(b'arch')
+                    (b / f'key.{arch}').write_text('k\n', encoding='utf-8')
+                (mac_work / f'metal-pack.{arch}.log').write_text('', encoding='utf-8')
+                self.assertEqual(model.pso_archive_progress(tmp), (3, 3, True))
+
+                # Chinese localization for batches and merging
+                m.lang = Lang('zh')
+                m._on_line('pso_offline: applegpu_g13s: merging 3 batches')
+                self.assertAlmostEqual(m.stages[-1].percent, 99.0, places=1)
+                self.assertIn('3 / 3 批 · 正在合并', m.stages[-1].detail)
+                m.lang = Lang('en')
+
+                # Native percentage stage line stops the directory poll and takes over
+                m._on_line('[12:00:05] [6/7] Pipeline archive 66% · 2 / 3 batches')
+                self.assertTrue(m._pso_native_progress)
+                self.assertIsNone(m._pso_poll_stop)
+                self.assertEqual(len(m.stages), 1)
+                self.assertAlmostEqual(m.stages[-1].percent, 66.0, places=1)
+                self.assertIn('2 / 3 batches', m.stages[-1].detail)
+                m.poll_pso_archive()
+                self.assertAlmostEqual(m.stages[-1].percent, 66.0, places=1)
+
+                # Stage completion stops any active poll and marks the stage done
+                m._on_line('[12:00:10] [6/7] Pipeline archive ✓ (9.0s)')
+                self.assertEqual(m.stages[-1].state, 'done')
+                self.assertIsNone(m._pso_poll_stop)
+            finally:
+                m._stop_pso_poll()
 
 
 if __name__ == '__main__':

@@ -87,8 +87,8 @@ final class BuildProgressTests: XCTestCase {
         let jsText = "{\"pipelines\":[" + Array(repeating: entry, count: 2500).joined(separator: ",") + "]}\n"
         try Data(jsText.utf8).write(to: macWork.appendingPathComponent("bases.mtl4-json"))
 
-        XCTAssertEqual(BuildProgress.psoArchiveProgress(workDir: tmp.path),
-                       PSOArchiveProgress(done: 0, total: 3, merging: false))
+        // Without a `batches.<arch>` directory (or batch log lines), return nil so single-invocation metal-tt shows no stuck "0 / N"
+        XCTAssertNil(BuildProgress.psoArchiveProgress(workDir: tmp.path))
 
         let arch = "applegpu_g13s"
         let b1 = macWork.appendingPathComponent("batches.\(arch)/00001")
@@ -114,5 +114,18 @@ final class BuildProgressTests: XCTestCase {
         try Data().write(to: macWork.appendingPathComponent("metal-pack.\(arch).log"))
         XCTAssertEqual(BuildProgress.psoArchiveProgress(workDir: tmp.path),
                        PSOArchiveProgress(done: 3, total: 3, merging: true))
+
+        // Log lines written by `pso_offline.py` provide exact batch counts independent of batchSize
+        let logsDir = tmp.appendingPathComponent("logs")
+        try fm.createDirectory(at: logsDir, withIntermediateDirectories: true)
+        let logContent = """
+        pso_offline: applegpu_g13s: batch 1/5: 500 bases, compiling or checking cache
+        pso_offline: applegpu_g13s: batch 1/5: ready (compiled)
+        pso_offline: applegpu_g13s: batch 2/5: ready (reused)
+        pso_offline: applegpu_g13s: batch 3/5: 500 bases, compiling or checking cache
+        """
+        try Data(logContent.utf8).write(to: logsDir.appendingPathComponent("pso_offline_mac.log"))
+        XCTAssertEqual(BuildProgress.psoArchiveProgress(workDir: tmp.path),
+                       PSOArchiveProgress(done: 2, total: 5, merging: false))
     }
 }

@@ -82,8 +82,9 @@ package enum BuildProgress {
     private static let basesCacheLock = NSLock()
     nonisolated(unsafe) private static var basesCache: (key: String, count: Int)?
 
-    /// Batch progress of `pso_offline.py` read from its work directory (`<work>/pso/mac-work` on macOS,
+    /// Batch progress of `pso_offline.py` read from its log or work directory (`<work>/pso/mac-work` on macOS,
     /// `<work>/ipa/build/ios/pso/work` on iOS) when the script has not emitted native JSON batch counts.
+    /// Returns `nil` when no batch compilation is active (e.g. single-invocation `metal-tt` without `batches.<arch>`).
     package static func psoArchiveProgress(workDir: String, batchSize: Int = 1000) -> PSOArchiveProgress? {
         guard !workDir.isEmpty, batchSize > 0 else { return nil }
         let fm = FileManager.default
@@ -101,6 +102,37 @@ package enum BuildProgress {
             }
         }
         guard !chosenWork.isEmpty else { return nil }
+        let cutoff = rootMtime.addingTimeInterval(-2)
+
+        // 1. Prefer `pso_offline.py`'s own batch log lines (`pso_offline: <arch>: batch i/N: ...` / `merging N batches`),
+        // which carry the exact batch total without reading `bases.mtl4-json` or assuming a fixed batch size.
+        if let fromLog = psoProgressFromLogs(workDir: workDir, cutoff: cutoff, fm: fm) {
+            return fromLog
+        }
+
+        // 2. Fall back to inspecting `batches.<arch>/NNNNN/`. If no `batches.*` folder exists yet, return nil
+        // immediately without reading the (potentially large) `bases.mtl4-json` or showing a misleading "0 / N" at 0%.
+        guard let entries = try? fm.contentsOfDirectory(atPath: chosenWork) else { return nil }
+        let archDirs = entries.filter { $0.hasPrefix("batches.") && $0.count > "batches.".count }
+        var chosenArch = ""
+        var latestArchMtime = Date.distantPast
+        for name in archDirs {
+            let p = chosenWork + "/" + name
+            var isDir: ObjCBool = false
+            guard fm.fileExists(atPath: p, isDirectory: &isDir), isDir.boolValue else { continue }
+            let mtime = (try? fm.attributesOfItem(atPath: p)[.modificationDate] as? Date) ?? .distantPast
+            if chosenArch.isEmpty || mtime >= latestArchMtime {
+                chosenArch = String(name.dropFirst("batches.".count))
+                latestArchMtime = mtime
+            }
+        }
+        guard !chosenArch.isEmpty else { return nil }
+        let batchesRoot = chosenWork + "/batches." + chosenArch
+        let firstBatchJS = batchesRoot + "/00001/bases.mtl4-json"
+        guard let firstAttr = try? fm.attributesOfItem(atPath: firstBatchJS),
+              let firstMtime = firstAttr[.modificationDate] as? Date,
+              firstMtime >= cutoff else { return nil }
+
         let jsPath = chosenWork + "/bases.mtl4-json"
         let cacheKey = "\(jsPath)|\(rootSize)|\(rootMtime.timeIntervalSince1970)"
         let basesCount: Int = {
@@ -127,21 +159,6 @@ package enum BuildProgress {
         }()
         guard basesCount > batchSize else { return nil }
         let total = (basesCount - 1) / batchSize + 1
-        guard let entries = try? fm.contentsOfDirectory(atPath: chosenWork) else { return nil }
-        let archDirs = entries.filter { $0.hasPrefix("batches.") && $0.count > "batches.".count }
-        var chosenArch = ""
-        var latestArchMtime = Date.distantPast
-        for name in archDirs {
-            let p = chosenWork + "/" + name
-            let mtime = (try? fm.attributesOfItem(atPath: p)[.modificationDate] as? Date) ?? .distantPast
-            if chosenArch.isEmpty || mtime >= latestArchMtime {
-                chosenArch = String(name.dropFirst("batches.".count))
-                latestArchMtime = mtime
-            }
-        }
-        guard !chosenArch.isEmpty else { return PSOArchiveProgress(done: 0, total: total, merging: false) }
-        let batchesRoot = chosenWork + "/batches." + chosenArch
-        let cutoff = rootMtime.addingTimeInterval(-2)
         var done = 0
         for index in 1...total {
             let batchDir = batchesRoot + "/" + String(format: "%05d", index)
@@ -162,6 +179,48 @@ package enum BuildProgress {
         let packLog = chosenWork + "/metal-pack." + chosenArch + ".log"
         let packMtime = (try? fm.attributesOfItem(atPath: packLog)[.modificationDate] as? Date) ?? .distantPast
         let merging = done == total && packMtime >= cutoff
+        return PSOArchiveProgress(done: done, total: total, merging: merging)
+    }
+
+    private static func psoProgressFromLogs(workDir: String, cutoff: Date, fm: FileManager) -> PSOArchiveProgress? {
+        let logNames = ["pso_offline_mac.log", "build_ipa.log", "build_framework.log", "prepare_xcode.log"]
+        var bestLog = ""
+        var bestMtime = Date.distantPast
+        for name in logNames {
+            let p = workDir + "/logs/" + name
+            guard let attr = try? fm.attributesOfItem(atPath: p),
+                  let mtime = attr[.modificationDate] as? Date,
+                  mtime >= cutoff else { continue }
+            if bestLog.isEmpty || mtime >= bestMtime {
+                bestLog = p; bestMtime = mtime
+            }
+        }
+        guard !bestLog.isEmpty,
+              let text = try? String(contentsOfFile: bestLog, encoding: .utf8) else { return nil }
+        guard let batchRe = try? NSRegularExpression(pattern: #"pso_offline: \S+: batch (\d+)/(\d+): (ready|\d+ bases)"#),
+              let mergeRe = try? NSRegularExpression(pattern: #"pso_offline: \S+: merging (\d+) batches"#) else { return nil }
+        var done = 0
+        var total = 0
+        var merging = false
+        for line in text.split(separator: "\n") {
+            let s = String(line)
+            let ns = s as NSString
+            let range = NSRange(location: 0, length: ns.length)
+            if let m = batchRe.firstMatch(in: s, range: range),
+               let idx = Int(ns.substring(with: m.range(at: 1))),
+               let tot = Int(ns.substring(with: m.range(at: 2))), tot > 0 {
+                let kind = ns.substring(with: m.range(at: 3))
+                total = tot
+                done = kind == "ready" ? idx : max(0, idx - 1)
+                merging = false
+            } else if let m = mergeRe.firstMatch(in: s, range: range),
+                      let tot = Int(ns.substring(with: m.range(at: 1))), tot > 0 {
+                total = tot
+                done = tot
+                merging = true
+            }
+        }
+        guard total > 0 else { return nil }
         return PSOArchiveProgress(done: done, total: total, merging: merging)
     }
     /// The last line of the log that says something: not blank, not a progress event. Used for the

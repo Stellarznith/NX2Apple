@@ -282,8 +282,16 @@ import XCTest
         let store = makeStore()
         store.effectiveWorkDir = temporary.path
         store.handleEvent("stage", ["k": 6, "n": 7, "name": "Pipeline archive", "step": "applegpu_g13s (metal-tt)"])
+        store.pollPSOArchive()
         XCTAssertEqual(store.stages[0].percent ?? 0, 100.0 / 3.0, accuracy: 0.1)
         XCTAssertTrue(store.stages[0].detail.contains("1 / 3 batches"))
+
+        // Verify localized unit and merging note in Chinese
+        store.lang = .zh
+        store.stages[0].detail = ""
+        store.pollPSOArchive()
+        XCTAssertTrue(store.stages[0].detail.contains("1 / 3 批"), store.stages[0].detail)
+        store.lang = .en
 
         // Once the script sends native progress, polling stops overriding it
         store.handleEvent("progress", ["k": 6, "name": "Pipeline archive", "step": "applegpu_g13s (metal-tt)",

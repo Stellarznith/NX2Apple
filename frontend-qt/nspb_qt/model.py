@@ -67,10 +67,54 @@ class Stage:
 
 _PSO_BASES_CACHE: tuple[tuple[str, int, float], int] | None = None
 _PSO_BASES_LOCK = threading.Lock()
+_PSO_LOG_BATCH_RE = re.compile(r'pso_offline: \S+: batch (\d+)/(\d+): (ready|\d+ bases)')
+_PSO_LOG_MERGE_RE = re.compile(r'pso_offline: \S+: merging (\d+) batches')
+
+
+def _pso_progress_from_logs(root: Path, cutoff: float) -> tuple[int, int, bool] | None:
+    """Parse exact `(done, total, merging)` counts from `pso_offline.py`'s own log lines when present."""
+    logs_dir = root / 'logs'
+    best_log: Path | None = None
+    best_mtime = -1.0
+    for name in ('pso_offline_mac.log', 'build_ipa.log', 'build_framework.log', 'prepare_xcode.log'):
+        cand = logs_dir / name
+        try:
+            st = cand.stat()
+        except OSError:
+            continue
+        if st.st_size > 0 and st.st_mtime >= cutoff and st.st_mtime >= best_mtime:
+            best_log = cand
+            best_mtime = st.st_mtime
+    if best_log is None:
+        return None
+    try:
+        text = best_log.read_text(encoding='utf-8', errors='replace')
+    except OSError:
+        return None
+    done = 0
+    total = 0
+    merging = False
+    for line in text.splitlines():
+        m = _PSO_LOG_BATCH_RE.search(line)
+        if m:
+            idx, tot, kind = int(m.group(1)), int(m.group(2)), m.group(3)
+            if tot > 0:
+                total = tot
+                done = idx if kind == 'ready' else max(0, idx - 1)
+                merging = False
+            continue
+        m2 = _PSO_LOG_MERGE_RE.search(line)
+        if m2:
+            tot = int(m2.group(1))
+            if tot > 0:
+                total = tot
+                done = tot
+                merging = True
+    return (done, total, merging) if total > 0 else None
 
 
 def pso_archive_progress(work_dir: str, batch_size: int = 1000) -> tuple[int, int, bool] | None:
-    """Batch progress of pso_offline.py read from its work directory when native counts are absent."""
+    """Batch progress of pso_offline.py read from its log or work directory when native counts are absent."""
     global _PSO_BASES_CACHE
     if not work_dir or batch_size <= 0:
         return None
@@ -90,6 +134,30 @@ def pso_archive_progress(work_dir: str, batch_size: int = 1000) -> tuple[int, in
             root_size = st.st_size
     if chosen_work is None:
         return None
+    cutoff = root_mtime - 2.0
+
+    # 1. Prefer `pso_offline.py`'s own batch log lines when present
+    from_log = _pso_progress_from_logs(root, cutoff)
+    if from_log is not None:
+        return from_log
+
+    # 2. Fall back to `batches.<arch>/NNNNN/`. Return None when no `batches.*` directory exists yet
+    # so single-invocation `metal-tt` neither reads `bases.mtl4-json` nor shows a stuck "0 / N" at 0%.
+    try:
+        arch_dirs = [p for p in chosen_work.iterdir() if p.is_dir() and p.name.startswith('batches.') and len(p.name) > 8]
+    except OSError:
+        return None
+    if not arch_dirs:
+        return None
+    chosen_arch_dir = max(arch_dirs, key=lambda p: p.stat().st_mtime if p.exists() else 0.0)
+    arch = chosen_arch_dir.name[len('batches.'):]
+    try:
+        first_bst = (chosen_arch_dir / '00001' / 'bases.mtl4-json').stat()
+    except OSError:
+        return None
+    if first_bst.st_mtime < cutoff:
+        return None
+
     js_path = str(chosen_work / 'bases.mtl4-json')
     cache_key = (js_path, root_size, root_mtime)
     with _PSO_BASES_LOCK:
@@ -108,15 +176,6 @@ def pso_archive_progress(work_dir: str, batch_size: int = 1000) -> tuple[int, in
     if bases_count <= batch_size:
         return None
     total = (bases_count - 1) // batch_size + 1
-    try:
-        arch_dirs = [p for p in chosen_work.iterdir() if p.is_dir() and p.name.startswith('batches.') and len(p.name) > 8]
-    except OSError:
-        return None
-    if not arch_dirs:
-        return (0, total, False)
-    chosen_arch_dir = max(arch_dirs, key=lambda p: p.stat().st_mtime if p.exists() else 0.0)
-    arch = chosen_arch_dir.name[len('batches.'):]
-    cutoff = root_mtime - 2.0
     done = 0
     for idx in range(1, total + 1):
         bdir = chosen_arch_dir / f'{idx:05d}'
@@ -212,6 +271,8 @@ class Model(QObject):
         self._proc: subprocess.Popen | None = None
         self._thread: threading.Thread | None = None
         self._line_buf = ''
+        self._pso_native_progress = False
+        self._pso_poll_stop: threading.Event | None = None
         # Every log line also goes to a file, so a user on a handheld can send one file instead of
         # copying text out of the window. One file per run, overwritten at start; the path is shown
         # in the log's first line so it can be found.
@@ -1815,6 +1876,7 @@ class Model(QObject):
             except OSError as e:
                 self.log(f'{e}\n')
             finally:
+                self._stop_pso_poll()
                 self._proc = None
             self._flush_lines()
             self.running = False
@@ -1898,10 +1960,36 @@ class Model(QObject):
                                  install=['/usr/bin/xcodebuild', '-downloadPlatform', 'iOS']))
 
     def cancel_build(self) -> None:
+        self._stop_pso_poll()
         if self._proc and self._proc.poll() is None:
             self._proc.terminate()
 
     # ---- the script's own progress lines
+
+    def _is_pso_stage_text(self, text: str) -> bool:
+        low = text.lower()
+        return 'pipeline archive' in low or self.t('stage.pipeline_archive').lower() in low
+
+    def _start_pso_poll(self) -> None:
+        self._stop_pso_poll()
+        self._pso_native_progress = False
+        self.poll_pso_archive()
+        stop_ev = threading.Event()
+        self._pso_poll_stop = stop_ev
+
+        def loop() -> None:
+            while not stop_ev.wait(1.0):
+                if getattr(self, '_pso_native_progress', False):
+                    break
+                self.poll_pso_archive()
+
+        threading.Thread(target=loop, daemon=True).start()
+
+    def _stop_pso_poll(self) -> None:
+        ev = getattr(self, '_pso_poll_stop', None)
+        if ev is not None:
+            ev.set()
+            self._pso_poll_stop = None
 
     def _on_line(self, line: str) -> None:
         """Feed one line of the build's output: stage lines move the stage list, everything
@@ -1921,26 +2009,61 @@ class Model(QObject):
             self.ipa_path = body.split(':', 1)[1].strip()
         for st in self.stages:
             if st.state == 'running':
-                st.detail = body[:120]
+                if not (self._is_pso_stage_text(st.name) and st.percent > 0 and not is_stage):
+                    st.detail = body[:120]
+                if not is_stage and body.lower().startswith('pipeline archive for'):
+                    self._start_pso_poll()
+                elif not is_stage and (_PSO_LOG_BATCH_RE.search(body) or _PSO_LOG_MERGE_RE.search(body)):
+                    self.poll_pso_archive()
                 break
         if is_stage:
             name = body[body.find(']') + 1:].strip()
-            if name and '✓' not in name:
+            if name and '✓' not in name and '✗' not in name:
+                pct_m = re.search(r'(\d+(?:\.\d+)?)%', name)
+                if (
+                    pct_m
+                    and self.stages
+                    and self.stages[-1].state == 'running'
+                    and self._is_pso_stage_text(self.stages[-1].name)
+                    and self._is_pso_stage_text(name)
+                ):
+                    self._pso_native_progress = True
+                    self._stop_pso_poll()
+                    self.stages[-1].percent = min(float(pct_m.group(1)), 100.0)
+                    after = name[pct_m.end():].lstrip(' ·,:')
+                    if after:
+                        self.stages[-1].detail = after
+                    self.stagesChanged.emit()
+                else:
+                    if self.stages and self.stages[-1].state == 'running':
+                        self.stages[-1].state = 'done'
+                    self.stages.append(Stage(name=name, state='running'))
+                    if self._is_pso_stage_text(name):
+                        self._start_pso_poll()
+                    else:
+                        self._stop_pso_poll()
+                    self.stagesChanged.emit()
+            elif name and ('✓' in name or '✗' in name):
+                self._stop_pso_poll()
                 if self.stages and self.stages[-1].state == 'running':
-                    self.stages[-1].state = 'done'
-                self.stages.append(Stage(name=name, state='running'))
-                self.stagesChanged.emit()
-            elif name and '✓' in name:
-                if self.stages and self.stages[-1].state == 'running':
-                    self.stages[-1].state = 'done'
+                    self.stages[-1].state = 'failed' if '✗' in name else 'done'
                     self.stagesChanged.emit()
 
     def poll_pso_archive(self) -> None:
         """Update the running Pipeline archive stage from pso_offline.py's work folder when present."""
+        if getattr(self, '_pso_native_progress', False):
+            return
         work = getattr(self, 'effective_work_dir', '')
         if not work:
             return
-        st = next((s for s in reversed(self.stages) if s.state == 'running' and 'pipeline archive' in s.name.lower()), None)
+        st = next(
+            (
+                s for s in reversed(self.stages)
+                if s.state == 'running'
+                and (self._is_pso_stage_text(s.name) or self._is_pso_stage_text(s.detail))
+            ),
+            None,
+        )
         if st is None:
             return
         prog = pso_archive_progress(work)
@@ -1948,7 +2071,9 @@ class Model(QObject):
             return
         done, total, merging = prog
         pct = min(done / total * 100.0, 99.0)
-        detail = f'{done:,} / {total:,} batches' + (' · merging' if merging else '')
+        unit = self.t('prog.unit.batches')
+        note = (' · ' + self.t('prog.note.merging')) if merging else ''
+        detail = f'{done:,} / {total:,} {unit}{note}'
         if st.percent != pct or st.detail != detail:
             st.percent = pct
             st.detail = detail
