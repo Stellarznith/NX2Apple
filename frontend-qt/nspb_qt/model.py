@@ -65,6 +65,84 @@ class Stage:
     percent: float = 0.0
 
 
+_PSO_BASES_CACHE: tuple[tuple[str, int, float], int] | None = None
+_PSO_BASES_LOCK = threading.Lock()
+
+
+def pso_archive_progress(work_dir: str, batch_size: int = 1000) -> tuple[int, int, bool] | None:
+    """Batch progress of pso_offline.py read from its work directory when native counts are absent."""
+    global _PSO_BASES_CACHE
+    if not work_dir or batch_size <= 0:
+        return None
+    root = Path(work_dir)
+    chosen_work: Path | None = None
+    root_mtime = -1.0
+    root_size = 0
+    for cand in (root / 'pso' / 'mac-work', root / 'ipa' / 'build' / 'ios' / 'pso' / 'work'):
+        js = cand / 'bases.mtl4-json'
+        try:
+            st = js.stat()
+        except OSError:
+            continue
+        if st.st_size > 0 and st.st_mtime >= root_mtime:
+            chosen_work = cand
+            root_mtime = st.st_mtime
+            root_size = st.st_size
+    if chosen_work is None:
+        return None
+    js_path = str(chosen_work / 'bases.mtl4-json')
+    cache_key = (js_path, root_size, root_mtime)
+    with _PSO_BASES_LOCK:
+        cached = _PSO_BASES_CACHE
+    if cached is not None and cached[0] == cache_key:
+        bases_count = cached[1]
+    else:
+        try:
+            data = Path(js_path).read_bytes()
+        except OSError:
+            return None
+        bases_count = data.count(b'"vertex_function_descriptor"')
+        if bases_count > 0:
+            with _PSO_BASES_LOCK:
+                _PSO_BASES_CACHE = (cache_key, bases_count)
+    if bases_count <= batch_size:
+        return None
+    total = (bases_count - 1) // batch_size + 1
+    try:
+        arch_dirs = [p for p in chosen_work.iterdir() if p.is_dir() and p.name.startswith('batches.') and len(p.name) > 8]
+    except OSError:
+        return None
+    if not arch_dirs:
+        return (0, total, False)
+    chosen_arch_dir = max(arch_dirs, key=lambda p: p.stat().st_mtime if p.exists() else 0.0)
+    arch = chosen_arch_dir.name[len('batches.'):]
+    cutoff = root_mtime - 2.0
+    done = 0
+    for idx in range(1, total + 1):
+        bdir = chosen_arch_dir / f'{idx:05d}'
+        try:
+            bst = (bdir / 'bases.mtl4-json').stat()
+        except OSError:
+            break
+        if bst.st_mtime < cutoff:
+            break
+        if (bdir / f'{arch}.mtl4a.partial').exists() or not (bdir / f'key.{arch}').exists():
+            break
+        try:
+            ast = (bdir / f'{arch}.mtl4a').stat()
+        except OSError:
+            break
+        if ast.st_size <= 0:
+            break
+        done = idx
+    pack_log = chosen_work / f'metal-pack.{arch}.log'
+    try:
+        merging = done == total and pack_log.stat().st_mtime >= cutoff
+    except OSError:
+        merging = False
+    return (done, total, merging)
+
+
 # ---------------------------------------------------------------- the model
 
 class Model(QObject):
@@ -1856,6 +1934,28 @@ class Model(QObject):
                 if self.stages and self.stages[-1].state == 'running':
                     self.stages[-1].state = 'done'
                     self.stagesChanged.emit()
+
+    def poll_pso_archive(self) -> None:
+        """Update the running Pipeline archive stage from pso_offline.py's work folder when present."""
+        work = getattr(self, 'effective_work_dir', '')
+        if not work:
+            return
+        st = next((s for s in reversed(self.stages) if s.state == 'running' and 'pipeline archive' in s.name.lower()), None)
+        if st is None:
+            return
+        prog = pso_archive_progress(work)
+        if prog is None:
+            return
+        done, total, merging = prog
+        pct = min(done / total * 100.0, 99.0)
+        detail = f'{done:,} / {total:,} batches' + (' · merging' if merging else '')
+        if st.percent != pct or st.detail != detail:
+            st.percent = pct
+            st.detail = detail
+            try:
+                self.stagesChanged.emit()
+            except RuntimeError:
+                pass
 
     def _flush_lines(self) -> None:
         self._line_buf = ''

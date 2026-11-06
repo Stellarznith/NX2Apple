@@ -201,6 +201,10 @@ func hop(_ body: @escaping @MainActor () -> Void) {
 
     var proc: RunningProcess?
     var staging: String?
+    var psoStageID: Int?
+    var psoStep = ""
+    var psoNativeProgress = false
+    var psoPollTask: Task<Void, Never>?
 
     /// - Parameters:
     ///   - volumesRoot: where external drives are mounted (the failure classifier reads it).
@@ -258,12 +262,13 @@ func hop(_ body: @escaping @MainActor () -> Void) {
 
     // MARK: Ending a build
 
-    package func fail(_ why: String) { running = false; doneNote = why; say("✗ " + why); cleanupStaging() }
+    package func fail(_ why: String) { stopPSOPoll(); running = false; doneNote = why; say("✗ " + why); cleanupStaging() }
 
     package func stop() {
         if case .moving = shellMove { stopShellMove(); return }
         guard running, !stopping, let proc, proc.isRunning else { return }
         stopping = true
+        stopPSOPoll()
         ProcessGroups.endGroup(proc.processIdentifier)   // the script and every tool it started
     }
 
@@ -272,9 +277,52 @@ func hop(_ body: @escaping @MainActor () -> Void) {
     }
 
     /// A stopped build leaves no half-finished stages behind: the progress starts empty again.
-    package func resetProgress() { stages = []; log.clear() }
+    package func resetProgress() { stopPSOPoll(); stages = []; log.clear() }
 
-    package func markAllDone() { for i in stages.indices where stages[i].state != .failed { stages[i].state = .done } }
+    package func markAllDone() { stopPSOPoll(); for i in stages.indices where stages[i].state != .failed { stages[i].state = .done } }
+
+    func startPSOPoll(stageID: Int, step: String) {
+        psoPollTask?.cancel()
+        psoStageID = stageID
+        psoStep = step
+        psoNativeProgress = false
+        pollPSOArchive()
+        psoPollTask = Task { @MainActor [weak store = self] in
+            while !Task.isCancelled {
+                try? await Task.sleep(nanoseconds: 1_000_000_000)
+                guard !Task.isCancelled, let store, store.psoStageID == stageID, !store.psoNativeProgress else { break }
+                store.pollPSOArchive()
+            }
+        }
+    }
+
+    func stopPSOPoll() {
+        psoPollTask?.cancel()
+        psoPollTask = nil
+        psoStageID = nil
+        psoStep = ""
+        psoNativeProgress = false
+    }
+
+    /// Inspect `<workDir>/pso/mac-work` (or the iOS work directory) for completed `pso_offline.py` batches while the
+    /// `Pipeline archive` stage runs without native JSON counts from the script.
+    package func pollPSOArchive() {
+        guard !psoNativeProgress, let id = psoStageID, !effectiveWorkDir.isEmpty,
+              let i = stages.firstIndex(where: { $0.id == id && $0.state == .running }),
+              let p = BuildProgress.psoArchiveProgress(workDir: effectiveWorkDir) else { return }
+        let pct = min(Double(p.done) / Double(p.total) * 100.0, 99.0)
+        let detail = BuildProgress.progressDetail([
+            "step": psoStep,
+            "done": p.done,
+            "total": p.total,
+            "unit": "batches",
+            "note": p.merging ? "merging" : "",
+        ])
+        if stages[i].percent != pct || stages[i].detail != detail {
+            stages[i].percent = pct
+            stages[i].detail = detail
+        }
+    }
 
     // MARK: Output parsing
 
@@ -344,6 +392,8 @@ func hop(_ body: @escaping @MainActor () -> Void) {
                 $0.eta = nil
                 $0.isScanningLastShaderFiles = false
             }
+            if name == "Pipeline archive" { startPSOPoll(stageID: k, step: step) }
+            else if psoStageID == k { stopPSOPoll() }
         case "step":
             let step = e["step"] as? String ?? ""
             append("    · \(step)\n")
@@ -353,8 +403,16 @@ func hop(_ body: @escaping @MainActor () -> Void) {
                 $0.eta = nil
                 $0.isScanningLastShaderFiles = false
             }
+            if step.hasPrefix("pipeline archive") { startPSOPoll(stageID: k, step: step) }
+            else if psoStageID == k { stopPSOPoll() }
         case "progress":
             let fraction = (e["frac"] as? NSNumber)?.doubleValue
+            let done = (e["done"] as? NSNumber)?.intValue
+            if psoStageID == k, fraction != nil || done != nil {
+                psoNativeProgress = true
+                psoPollTask?.cancel()
+                psoPollTask = nil
+            }
             let detail = BuildProgress.progressDetail(e)
             let eta = (e["eta"] as? NSNumber)?.doubleValue
             stage {
@@ -365,6 +423,7 @@ func hop(_ body: @escaping @MainActor () -> Void) {
                 $0.isScanningLastShaderFiles = BuildProgress.isScanningLastShaderFiles(e)
             }
         case "stage_end":
+            if psoStageID == k { stopPSOPoll() }
             let ok = e["ok"] as? Bool ?? true, summary = e["summary"] as? String ?? ""
             let elapsed = BuildProgress.duration((e["elapsed"] as? NSNumber)?.doubleValue ?? 0)
             append("\(ok ? "✓" : "✗") \(e["name"] as? String ?? "") (\(elapsed))" + (summary.isEmpty ? "" : ": \(summary)") + "\n")

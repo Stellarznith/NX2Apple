@@ -63,9 +63,107 @@ package enum StepState: Equatable {
     }
 }
 
+/// Offline pipeline archive (`pso_offline.py`) batch progress inspected from its work directory.
+package struct PSOArchiveProgress: Equatable, Sendable {
+    package let done: Int
+    package let total: Int
+    package let merging: Bool
+
+    package init(done: Int, total: Int, merging: Bool = false) {
+        self.done = done
+        self.total = total
+        self.merging = merging
+    }
+}
+
 /// Reading what a build prints: the script's stage lines and JSON events, durations, the steps of Xcode and the install, and what
 /// a failed install says. Pure functions of the text.
 package enum BuildProgress {
+    private static let basesCacheLock = NSLock()
+    nonisolated(unsafe) private static var basesCache: (key: String, count: Int)?
+
+    /// Batch progress of `pso_offline.py` read from its work directory (`<work>/pso/mac-work` on macOS,
+    /// `<work>/ipa/build/ios/pso/work` on iOS) when the script has not emitted native JSON batch counts.
+    package static func psoArchiveProgress(workDir: String, batchSize: Int = 1000) -> PSOArchiveProgress? {
+        guard !workDir.isEmpty, batchSize > 0 else { return nil }
+        let fm = FileManager.default
+        let candidates = [workDir + "/pso/mac-work", workDir + "/ipa/build/ios/pso/work"]
+        var chosenWork = ""
+        var rootMtime = Date.distantPast
+        var rootSize: UInt64 = 0
+        for dir in candidates {
+            let js = dir + "/bases.mtl4-json"
+            guard let attr = try? fm.attributesOfItem(atPath: js),
+                  let size = attr[.size] as? UInt64, size > 0,
+                  let mtime = attr[.modificationDate] as? Date else { continue }
+            if mtime >= rootMtime {
+                chosenWork = dir; rootMtime = mtime; rootSize = size
+            }
+        }
+        guard !chosenWork.isEmpty else { return nil }
+        let jsPath = chosenWork + "/bases.mtl4-json"
+        let cacheKey = "\(jsPath)|\(rootSize)|\(rootMtime.timeIntervalSince1970)"
+        let basesCount: Int = {
+            basesCacheLock.lock()
+            if let cached = basesCache, cached.key == cacheKey {
+                basesCacheLock.unlock()
+                return cached.count
+            }
+            basesCacheLock.unlock()
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: jsPath), options: .mappedIfSafe) else { return 0 }
+            let token = Data("\"vertex_function_descriptor\"".utf8)
+            var count = 0
+            var searchRange = data.startIndex..<data.endIndex
+            while let r = data.range(of: token, options: [], in: searchRange) {
+                count += 1
+                searchRange = r.upperBound..<data.endIndex
+            }
+            if count > 0 {
+                basesCacheLock.lock()
+                basesCache = (cacheKey, count)
+                basesCacheLock.unlock()
+            }
+            return count
+        }()
+        guard basesCount > batchSize else { return nil }
+        let total = (basesCount - 1) / batchSize + 1
+        guard let entries = try? fm.contentsOfDirectory(atPath: chosenWork) else { return nil }
+        let archDirs = entries.filter { $0.hasPrefix("batches.") && $0.count > "batches.".count }
+        var chosenArch = ""
+        var latestArchMtime = Date.distantPast
+        for name in archDirs {
+            let p = chosenWork + "/" + name
+            let mtime = (try? fm.attributesOfItem(atPath: p)[.modificationDate] as? Date) ?? .distantPast
+            if chosenArch.isEmpty || mtime >= latestArchMtime {
+                chosenArch = String(name.dropFirst("batches.".count))
+                latestArchMtime = mtime
+            }
+        }
+        guard !chosenArch.isEmpty else { return PSOArchiveProgress(done: 0, total: total, merging: false) }
+        let batchesRoot = chosenWork + "/batches." + chosenArch
+        let cutoff = rootMtime.addingTimeInterval(-2)
+        var done = 0
+        for index in 1...total {
+            let batchDir = batchesRoot + "/" + String(format: "%05d", index)
+            let batchJS = batchDir + "/bases.mtl4-json"
+            guard let bAttr = try? fm.attributesOfItem(atPath: batchJS),
+                  let bMtime = bAttr[.modificationDate] as? Date,
+                  bMtime >= cutoff else { break }
+            let keyPath = batchDir + "/key." + chosenArch
+            let archivePath = batchDir + "/" + chosenArch + ".mtl4a"
+            let partialPath = archivePath + ".partial"
+            if fm.fileExists(atPath: partialPath) || !fm.fileExists(atPath: keyPath) {
+                break
+            }
+            guard let aAttr = try? fm.attributesOfItem(atPath: archivePath),
+                  let aSize = aAttr[.size] as? UInt64, aSize > 0 else { break }
+            done = index
+        }
+        let packLog = chosenWork + "/metal-pack." + chosenArch + ".log"
+        let packMtime = (try? fm.attributesOfItem(atPath: packLog)[.modificationDate] as? Date) ?? .distantPast
+        let merging = done == total && packMtime >= cutoff
+        return PSOArchiveProgress(done: done, total: total, merging: merging)
+    }
     /// The last line of the log that says something: not blank, not a progress event. Used for the
     /// failure note, where the exit code on its own is not actionable (issue #52).
     package static func lastMeaningfulLine(_ log: String) -> String? {

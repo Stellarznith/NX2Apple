@@ -450,6 +450,33 @@ class ParityWindowTests(unittest.TestCase):
             self.assertEqual(m.t('install.reveal'), 'Show in folder')
             self.assertIn('this PC', m.t('shell.copyExternalNote'))
 
+    def test_pso_archive_progress(self) -> None:
+        from nspb_qt import model
+        with tempfile.TemporaryDirectory() as tmp:
+            mac_work = Path(tmp, 'pso', 'mac-work')
+            mac_work.mkdir(parents=True)
+            entry = '{"vertex_function_descriptor":"v"}'
+            (mac_work / 'bases.mtl4-json').write_text('[' + ','.join([entry] * 2500) + ']\n', encoding='utf-8')
+            self.assertEqual(model.pso_archive_progress(tmp), (0, 3, False))
+
+            arch = 'applegpu_g13s'
+            for idx in (1, 2, 3):
+                (mac_work / f'batches.{arch}' / f'{idx:05d}').mkdir(parents=True)
+            b1 = mac_work / f'batches.{arch}' / '00001'
+            (b1 / 'bases.mtl4-json').write_text('{}', encoding='utf-8')
+            (b1 / f'{arch}.mtl4a').write_bytes(b'arch')
+            (b1 / f'key.{arch}').write_text('k\n', encoding='utf-8')
+            (mac_work / f'batches.{arch}' / '00002' / 'bases.mtl4-json').write_text('{}', encoding='utf-8')
+            self.assertEqual(model.pso_archive_progress(tmp), (1, 3, False))
+
+            for idx in (2, 3):
+                b = mac_work / f'batches.{arch}' / f'{idx:05d}'
+                (b / 'bases.mtl4-json').write_text('{}', encoding='utf-8')
+                (b / f'{arch}.mtl4a').write_bytes(b'arch')
+                (b / f'key.{arch}').write_text('k\n', encoding='utf-8')
+            (mac_work / f'metal-pack.{arch}.log').write_text('', encoding='utf-8')
+            self.assertEqual(model.pso_archive_progress(tmp), (3, 3, True))
+
 
 if __name__ == '__main__':
     unittest.main()
