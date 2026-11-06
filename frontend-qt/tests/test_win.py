@@ -3050,6 +3050,119 @@ class WindowsBuildFixesTest(unittest.TestCase):
                     self.assertEqual(clone_mock.call_count, 0)
                     self.assertTrue(tc.is_sdk_dir(sdk_dir))
 
+    def test_install_sdk_from_zip_rejects_drive_paths_symlink_escapes_and_version_traversal(self) -> None:
+        """Archive extraction must reject drive-qualified paths, symlink escapes, and Version traversal
+        while leaving outside sentinels and any pre-existing cached SDK intact."""
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            cache = root / 'local' / 'NS Port Builder' / 'sdk'
+            cache.mkdir(parents=True)
+            outside_sentinel = root / 'outside_sentinel.txt'
+            outside_sentinel.write_text('OUTSIDE_SECRET_DO_NOT_TOUCH', encoding='utf-8')
+            outside_victim = root / 'iPhoneOS_victim.sdk'
+            outside_victim.mkdir()
+            (outside_victim / 'keep.txt').write_text('KEEP_ME', encoding='utf-8')
+
+            existing_sdk = make_fake_sdk(cache, '27.2')
+            (existing_sdk / 'existing_marker.txt').write_text('EXISTING_OK', encoding='utf-8')
+
+            def write_sdk_zip(zpath: Path, *, extra_file: tuple[str, str] | None = None,
+                              extra_symlink: tuple[str, str] | None = None,
+                              sdk_folder: str = 'iPhoneOS27.2.sdk',
+                              sdk_version: str = '27.2') -> Path:
+                with zipfile.ZipFile(zpath, 'w') as zf:
+                    def add_file(arcname: str, data: str) -> None:
+                        zi = zipfile.ZipInfo(arcname)
+                        zi.external_attr = (0o100644 << 16)
+                        zf.writestr(zi, data.encode('utf-8'))
+
+                    def add_symlink(arcname: str, target: str) -> None:
+                        zi = zipfile.ZipInfo(arcname)
+                        zi.external_attr = (0o120777 << 16)
+                        zf.writestr(zi, target.encode('utf-8'))
+
+                    add_file(f'{sdk_folder}/SDKSettings.json', json.dumps({'Version': sdk_version}))
+                    add_file(f'{sdk_folder}/System/Library/Frameworks/UIKit.framework/Headers/UIKit.h', '// h\n')
+                    add_file(f'{sdk_folder}/System/Library/Frameworks/UIKit.framework/UIKit.tbd', '--- !tapi-tbd\n')
+                    add_file(f'{sdk_folder}/System/Library/Frameworks/Foundation.framework/Foundation.tbd', '--- !tapi-tbd\n')
+                    add_file(f'{sdk_folder}/usr/lib/libSystem.tbd', '--- !tapi-tbd\n')
+                    if extra_file:
+                        add_file(extra_file[0], extra_file[1])
+                    if extra_symlink:
+                        add_symlink(extra_symlink[0], extra_symlink[1])
+                return zpath
+
+            with mock.patch.dict(os.environ, {'LOCALAPPDATA': str(root / 'local')}, clear=False):
+                # 1. Drive-qualified, UNC, and parent-traversal member paths must be rejected
+                for bad_member in ('C:outside_sentinel.txt', 'C:\\outside_sentinel.txt',
+                                   '..\\outside_sentinel.txt', '../outside_sentinel.txt'):
+                    bad_zip = write_sdk_zip(root / 'bad_member.zip', extra_file=(bad_member, 'OVERWRITTEN'))
+                    with self.assertRaises(sdk_fetch.SdkError):
+                        sdk_fetch.install_sdk_from_zip(bad_zip, dest=cache)
+                    self.assertEqual(outside_sentinel.read_text(encoding='utf-8'), 'OUTSIDE_SECRET_DO_NOT_TOUCH')
+
+                # 2. Symlink targets escaping staging or using drive/absolute paths must be rejected
+                for bad_target in ('../../../../../outside_sentinel.txt',
+                                   '..\\..\\..\\..\\..\\outside_sentinel.txt',
+                                   'C:/outside_sentinel.txt',
+                                   '/outside_sentinel.txt'):
+                    sym_zip = write_sdk_zip(
+                        root / 'bad_sym.zip',
+                        extra_symlink=('iPhoneOS27.2.sdk/usr/lib/leak.tbd', bad_target),
+                    )
+                    with self.assertRaises(sdk_fetch.SdkError):
+                        sdk_fetch.install_sdk_from_zip(sym_zip, dest=cache)
+                    self.assertFalse((existing_sdk / 'usr/lib/leak.tbd').exists())
+
+                # Direct `_materialize` check: neither strict nor non-strict mode may copy outside files
+                stage_test = cache / 'stage_direct'
+                (stage_test / 'sub').mkdir(parents=True)
+                with self.assertRaises(sdk_fetch.SdkError):
+                    sdk_fetch._materialize(
+                        stage_test,
+                        [('sub/leak.txt', '../../../outside_sentinel.txt')],
+                        lambda _s: None,
+                        strict=True,
+                    )
+                sdk_fetch._materialize(
+                    stage_test,
+                    [('sub/leak.txt', '../../../outside_sentinel.txt')],
+                    lambda _s: None,
+                    strict=False,
+                )
+                self.assertFalse((stage_test / 'sub/leak.txt').exists())
+                shutil.rmtree(stage_test)
+
+                # 3. SDKSettings.json `Version` traversal must be rejected without deleting outside folders
+                for bad_ver in ('../../iPhoneOS_victim', '/../iPhoneOS_victim', '27.2/../../outside'):
+                    ver_zip = write_sdk_zip(
+                        root / 'bad_ver.zip',
+                        sdk_folder='InnerSDK',
+                        sdk_version=bad_ver,
+                    )
+                    with self.assertRaises(sdk_fetch.SdkError):
+                        sdk_fetch.install_sdk_from_zip(ver_zip, dest=cache)
+                    self.assertTrue((outside_victim / 'keep.txt').is_file())
+                    self.assertEqual((existing_sdk / 'existing_marker.txt').read_text(encoding='utf-8'), 'EXISTING_OK')
+
+                # 4. Rollback: if moving the new SDK into place fails, the pre-existing SDK is restored
+                good_zip = write_sdk_zip(root / 'good.zip')
+                real_move = sdk_fetch.shutil.move
+                move_calls = 0
+
+                def failing_second_move(src, dst, *a, **kw):
+                    nonlocal move_calls
+                    move_calls += 1
+                    if move_calls == 2:
+                        raise OSError('simulated disk error during final move')
+                    return real_move(src, dst, *a, **kw)
+
+                with mock.patch.object(sdk_fetch.shutil, 'move', side_effect=failing_second_move):
+                    with self.assertRaises(sdk_fetch.SdkError):
+                        sdk_fetch.install_sdk_from_zip(good_zip, dest=cache)
+                self.assertTrue(tc.is_sdk_dir(existing_sdk))
+                self.assertEqual((existing_sdk / 'existing_marker.txt').read_text(encoding='utf-8'), 'EXISTING_OK')
+
     def test_clone_sdk_retries_next_mirror_when_sparse_checkout_fails(self) -> None:
         """If git sparse-checkout fails on the first mirror, clone_sdk must retry the next mirror."""
         with tempfile.TemporaryDirectory() as td:
@@ -3164,6 +3277,28 @@ class WindowsBuildFixesTest(unittest.TestCase):
                 chosen, ok, ver = pu.find_python()
                 self.assertEqual((chosen, ok, ver), (str(py312), True, '3.12'))
                 self.assertEqual(pu.venv_base(''), str(py312))
+
+            # Verify pu.child_env preserves user PYTHONPATH in non-frozen runs and only strips _MEIPASS
+            sep = ';' if pu.IS_WIN else ':'
+            with mock.patch.dict(os.environ, {'PYTHONPATH': '/custom/user/lib'}, clear=False), \
+                 mock.patch.object(sys, '_MEIPASS', None, create=True), \
+                 mock.patch.object(sys, 'frozen', False, create=True):
+                cenv = pu.child_env()
+                self.assertEqual(cenv.get('PYTHONPATH'), '/custom/user/lib')
+            with mock.patch.dict(
+                os.environ,
+                {
+                    'PYTHONPATH': f'{internal}{sep}/custom/user/lib',
+                    'PYTHONHOME': str(internal),
+                    '_MEIPASS': str(internal),
+                },
+                clear=False,
+            ), mock.patch.object(sys, '_MEIPASS', str(internal), create=True), \
+               mock.patch.object(sys, 'frozen', True, create=True):
+                cenv_frozen = pu.child_env()
+                self.assertEqual(cenv_frozen.get('PYTHONPATH'), '/custom/user/lib')
+                self.assertNotIn('PYTHONHOME', cenv_frozen)
+                self.assertNotIn('_MEIPASS', cenv_frozen)
 
 
 if __name__ == '__main__':
